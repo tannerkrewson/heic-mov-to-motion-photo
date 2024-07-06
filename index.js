@@ -1,34 +1,73 @@
-// Import modules
 const fs = require("fs");
 const path = require("path");
-const exiftool = require("exiftool-vendored");
-const { ExifTool } = require("exiftool-vendored");
-const exiftoolProcess = new ExifTool({ taskTimeoutMillis: 5000 });
-const yargs = require("yargs");
+const sharp = require("sharp");
+const exiftool = require("exiftool-vendored").exiftool;
+const { execSync } = require("child_process");
+const readline = require("readline");
 
-// Define functions
+const problematicFiles = [];
+const processedFiles = [];
+
 const validateDirectory = (dir) => {
-	// Check if the directory exists and is a directory
+	if (!dir) {
+		console.error("No directory path provided.");
+		return false;
+	}
 	if (!fs.existsSync(dir)) {
-		console.error(`Path doesn't exist: ${dir}`);
-		process.exit(1);
+		console.error(`Directory does not exist: ${dir}`);
+		return false;
 	}
 	if (!fs.lstatSync(dir).isDirectory()) {
 		console.error(`Path is not a directory: ${dir}`);
-		process.exit(1);
+		return false;
+	}
+	return true;
+};
+
+const validateFile = (filePath) => {
+	if (!filePath) {
+		console.error("No file path provided.");
+		return false;
+	}
+	if (!fs.existsSync(filePath)) {
+		console.error(`File does not exist: ${filePath}`);
+		return false;
+	}
+	return true;
+};
+
+const convertHeicToJpeg = async (heicPath) => {
+	console.log(`Converting HEIC file to JPEG: ${heicPath}`);
+	try {
+		const jpegPath = `${path.parse(heicPath).name}.jpg`;
+		await sharp(heicPath).jpeg().toFile(jpegPath);
+		console.log(`HEIC file converted to JPEG: ${jpegPath}`);
+
+		// Copy EXIF data from HEIC to JPEG
+		const exifData = await exiftool.read(heicPath);
+		if (exifData) {
+			await exiftool.write(jpegPath, exifData);
+			console.log("EXIF data copied from HEIC to JPEG.");
+		} else {
+			console.warn("No EXIF data found in HEIC file.");
+		}
+
+		processedFiles.push(heicPath);
+		return jpegPath;
+	} catch (error) {
+		console.warn(`Error converting HEIC file: ${heicPath}: ${error.message}`);
+		problematicFiles.push(heicPath);
+		return null;
 	}
 };
 
 const validateMedia = (photoPath, videoPath) => {
-	// Check if the files are valid inputs. Currently the only supported inputs are MP4/MOV and JPEG filetypes.
-	// Currently it only checks file extensions instead of actually checking file formats via file signature bytes.
-	// Returns true if photo and video files are valid, else false
-	if (!fs.existsSync(photoPath)) {
-		console.error(`Photo does not exist: ${photoPath}`);
+	if (!validateFile(photoPath)) {
+		console.error("Invalid photo path.");
 		return false;
 	}
-	if (!fs.existsSync(videoPath)) {
-		console.error(`Video does not exist: ${videoPath}`);
+	if (!validateFile(videoPath)) {
+		console.error("Invalid video path.");
 		return false;
 	}
 	if (
@@ -42,217 +81,275 @@ const validateMedia = (photoPath, videoPath) => {
 		!videoPath.toLowerCase().endsWith(".mov") &&
 		!videoPath.toLowerCase().endsWith(".mp4")
 	) {
-		console.error(`Video isn't a MOV or MP4: ${photoPath}`);
+		console.error(`Video isn't a MOV or MP4: ${videoPath}`);
 		return false;
 	}
 	return true;
 };
 
 const mergeFiles = (photoPath, videoPath, outputPath) => {
-	// Merges the photo and video file together by concatenating the video at the end of the photo. Writes the output to
-	// a temporary folder.
-	// Returns the file name of the merged output file
 	console.log(`Merging ${photoPath} and ${videoPath}.`);
 	const outPath = path.join(outputPath, path.basename(photoPath));
 	fs.mkdirSync(path.dirname(outPath), { recursive: true });
-	const outfile = fs.createWriteStream(outPath);
-	const photo = fs.createReadStream(photoPath);
-	const video = fs.createReadStream(videoPath);
-	photo.pipe(outfile, { end: false });
-	photo.on("end", () => {
-		video.pipe(outfile);
-	});
-	console.log(`Merged photo and video.`);
+	const photoData = fs.readFileSync(photoPath);
+	const videoData = fs.readFileSync(videoPath);
+	fs.writeFileSync(outPath, Buffer.concat([photoData, videoData]));
+	console.log("Merged photo and video.");
+	processedFiles.push(photoPath, videoPath);
 	return outPath;
 };
 
 const addXmpMetadata = async (mergedFile, offset) => {
-	// Adds XMP metadata to the merged image indicating the byte offset in the file where the video begins.
-	console.log(`Reading existing metadata from file.`);
-	const metadata = await exiftoolProcess.read(mergedFile);
-	console.log(`Found XMP keys: ${Object.keys(metadata)}`);
+	const metadata = await exiftool.read(mergedFile);
+	console.log("Reading existing metadata from file.");
 	if (Object.keys(metadata).length > 0) {
 		console.warn(
-			`Found existing XMP keys. They *may* be affected after this process.`
+			"Found existing XMP keys. They *may* be affected after this process."
 		);
 	}
 
-	// exiftool-vendored automatically registers the GCamera namespace, so no need to do it manually
-	metadata["Xmp.GCamera.MicroVideo"] = 1;
-	metadata["Xmp.GCamera.MicroVideoVersion"] = 1;
-	metadata["Xmp.GCamera.MicroVideoOffset"] = offset;
-	metadata["Xmp.GCamera.MicroVideoPresentationTimestampUs"] = 1500000; // in Apple Live Photos, the chosen photo is 1.5s after the start of the video, so 1500000 microseconds
-	await exiftoolProcess.write(mergedFile, metadata);
+	try {
+		await exiftool.write(mergedFile, {
+			"XMP:MicroVideo": 1,
+			"XMP:MicroVideoVersion": 1,
+			"XMP:MicroVideoOffset": offset,
+			"XMP:MicroVideoPresentationTimestampUs": 1500000,
+		});
+	} catch (error) {
+		console.warn("exiv2 detected that the GCamera namespace already exists.");
+	}
 };
 
 const convert = async (photoPath, videoPath, outputPath) => {
-	// Performs the conversion process to mux the files together into a Google Motion Photo.
-	// Returns true if conversion was successful, else false
+	if (!validateMedia(photoPath, videoPath)) {
+		console.error("Invalid photo or video path.");
+		return;
+	}
 	const merged = mergeFiles(photoPath, videoPath, outputPath);
 	const photoFilesize = fs.statSync(photoPath).size;
 	const mergedFilesize = fs.statSync(merged).size;
-
-	// The 'offset' field in the XMP metadata should be the offset (in bytes) from the end of the file to the part
-	// where the video portion of the merged file begins. In other words, merged size - photo_only_size = offset.
 	const offset = mergedFilesize - photoFilesize;
 	await addXmpMetadata(merged, offset);
 };
 
-const matchingVideo = (photoPath) => {
-	// Returns the matching video file for the given photo file, or an empty string if none is found
-	const { dir, name } = path.parse(photoPath);
-	const base = `./${dir}/${name}`;
-	console.log(path.parse(photoPath));
-	console.log(`Looking for videos named: ${base}`);
-	if (fs.existsSync(base + ".mov")) {
-		return base + ".mov";
+const matchingVideo = (photoPath, videoDir) => {
+	const base = path.parse(photoPath).name;
+	const files = fs.readdirSync(videoDir);
+	for (const file of files) {
+		if (
+			file.startsWith(base) &&
+			(file.toLowerCase().endsWith(".mov") ||
+				file.toLowerCase().endsWith(".mp4"))
+		) {
+			return path.join(videoDir, file);
+		}
 	}
-	if (fs.existsSync(base + ".mp4")) {
-		return base + ".mp4";
-	}
-	if (fs.existsSync(base + ".MOV")) {
-		return base + ".MOV";
-	}
-	if (fs.existsSync(base + ".MP4")) {
-		return base + ".MP4";
-	}
-	return "";
+	return null;
 };
 
-const processDirectory = async (fileDir, recurse) => {
-	// Loops through files in the specified directory and generates a list of (photo, video) path tuples that can
-	// be converted
-	// TODO: Implement recursive scan
-	// Returns a list of tuples containing matched photo/video pairs.
-	console.log(`Processing dir: ${fileDir}`);
-	if (recurse) {
-		console.error(`Recursive traversal is not implemented yet.`);
+const uniquePath = (destination, filename) => {
+	const { name, ext } = path.parse(filename);
+	let counter = 1;
+	let newFilename = filename;
+	while (fs.existsSync(path.join(destination, newFilename))) {
+		newFilename = `${name}(${counter})${ext}`;
+		counter++;
+	}
+	return path.join(destination, newFilename);
+};
+
+const processDirectory = async (
+	inputDir,
+	outputDir,
+	moveOtherImages,
+	convertAllHeic,
+	deleteConverted
+) => {
+	console.log(`Processing files in: ${inputDir}`);
+
+	if (!validateDirectory(inputDir)) {
+		console.error("Invalid input directory.");
 		process.exit(1);
 	}
 
-	const filePairs = [];
-	for (const file of fs.readdirSync(fileDir)) {
-		const fileFullpath = path.join(fileDir, file);
-		if (
-			(fs.lstatSync(fileFullpath).isFile() &&
-				file.toLowerCase().endsWith(".jpg")) ||
+	if (!validateDirectory(outputDir)) {
+		console.error("Invalid output directory.");
+		process.exit(1);
+	}
+
+	let matchingPairs = 0;
+	const files = fs.readdirSync(inputDir);
+	for (const file of files) {
+		const filePath = path.join(inputDir, file);
+		if (file.toLowerCase().endsWith(".heic")) {
+			if (convertAllHeic || matchingVideo(filePath, inputDir)) {
+				const jpegPath = await convertHeicToJpeg(filePath);
+				if (jpegPath) {
+					const videoPath = matchingVideo(jpegPath, inputDir);
+					if (videoPath) {
+						await convert(jpegPath, videoPath, outputDir);
+						matchingPairs++;
+					}
+				}
+				if (deleteConverted && fs.existsSync(filePath)) {
+					try {
+						fs.unlinkSync(filePath);
+						console.log(`Deleted converted HEIC file: ${filePath}`);
+					} catch (error) {
+						console.warn(`Failed to delete file ${filePath}: ${error.message}`);
+					}
+				}
+			}
+		} else if (
+			file.toLowerCase().endsWith(".jpg") ||
 			file.toLowerCase().endsWith(".jpeg")
 		) {
-			const videoFile = matchingVideo(fileFullpath);
-			if (videoFile !== "") {
-				filePairs.push([fileFullpath, videoFile]);
+			const videoPath = matchingVideo(filePath, inputDir);
+			if (videoPath) {
+				await convert(filePath, videoPath, outputDir);
+				matchingPairs++;
 			}
 		}
 	}
 
-	console.log(`Found ${filePairs.length} pairs.`);
-	console.log(
-		`subset of found image/video pairs: ${JSON.stringify(
-			filePairs.slice(0, 9)
-		)}`
-	);
-	return filePairs;
-};
+	console.log("Conversion complete.");
+	console.log(`Found ${matchingPairs} matching HEIC/JPEG and MOV/MP4 pairs.`);
 
-const main = async (args) => {
-	const outdir = args.output || "output";
-
-	if (args.dir) {
-		validateDirectory(args.dir);
-		const pairs = await processDirectory(args.dir, args.recurse);
-		const processedFiles = new Set();
-		for (const pair of pairs) {
-			if (validateMedia(pair[0], pair[1])) {
-				await convert(pair[0], pair[1], outdir);
-				processedFiles.add(pair[0]);
-				processedFiles.add(pair[1]);
-			}
-		}
-
-		if (args.copyall) {
-			// Copy the remaining files to outdir
-			const allFiles = new Set(
-				fs.readdirSync(args.dir).map((file) => path.join(args.dir, file))
-			);
-			const remainingFiles = new Set(
-				[...allFiles].filter((file) => !processedFiles.has(file))
-			);
-
-			console.log(
-				`Found ${remainingFiles.size} remaining files that will copied.`
-			);
-
-			if (remainingFiles.size > 0) {
-				// Ensure the destination directory exists
-				fs.mkdirSync(outdir, { recursive: true });
-
-				for (const file of remainingFiles) {
-					const fileName = path.basename(file);
-					const destinationPath = path.join(outdir, fileName);
-					fs.copyFileSync(file, destinationPath);
+	if (moveOtherImages) {
+		const otherFilesDir = path.join(outputDir, "other_files");
+		fs.mkdirSync(otherFilesDir, { recursive: true });
+		for (const file of files) {
+			const filePath = path.join(inputDir, file);
+			if (
+				[".heic", ".jpg", ".jpeg", ".mov", ".mp4", ".png", ".gif"].includes(
+					path.extname(file).toLowerCase()
+				)
+			) {
+				if (!processedFiles.includes(filePath)) {
+					const uniqueFilePath = uniquePath(
+						otherFilesDir,
+						path.basename(filePath)
+					);
+					fs.renameSync(filePath, uniqueFilePath);
+					console.log(
+						`Moved ${path.basename(uniqueFilePath)} to output directory.`
+					);
 				}
 			}
 		}
-	} else {
-		if (!args.photo && !args.video) {
-			console.error(`Either --dir or --photo and --video are required.`);
-			process.exit(1);
-		}
-
-		if ((args.photo && !args.video) || (!args.photo && args.video)) {
-			console.error(`Both --photo and --video must be provided.`);
-			process.exit(1);
-		}
-
-		if (validateMedia(args.photo, args.video)) {
-			await convert(args.photo, args.video, outdir);
-		}
 	}
+
+	console.log("Cleanup complete.");
 };
 
-// Parse command line arguments
-const argv = yargs
-	.option("verbose", {
-		alias: "v",
-		type: "boolean",
-		description: "Show logging messages.",
-		default: false,
-	})
-	.option("dir", {
-		alias: "d",
-		type: "string",
-		description:
-			"Process a directory for photos/videos. Takes precedence over --photo/--video",
-	})
-	.option("recurse", {
-		alias: "r",
-		type: "boolean",
-		description:
-			"Recursively process a directory. Only applies if --dir is also provided",
-		default: false,
-	})
-	.option("photo", {
-		alias: "p",
-		type: "string",
-		description: "Path to the JPEG photo to add.",
-	})
-	.option("video", {
-		alias: "v",
-		type: "string",
-		description: "Path to the MOV video to add.",
-	})
-	.option("output", {
-		alias: "o",
-		type: "string",
-		description: "Path to where files should be written out to.",
-	})
-	.option("copyall", {
-		alias: "c",
-		type: "boolean",
-		description: "Copy unpaired files to directory.",
-		default: false,
-	})
-	.help()
-	.alias("help", "h").argv;
+const deleteOriginalFiles = () => {
+	console.log("Deleting original HEIC and MOV/MP4 files.");
+	for (const filePath of processedFiles) {
+		if (fs.existsSync(filePath)) {
+			try {
+				fs.unlinkSync(filePath);
+				console.log(`Deleted original file: ${filePath}`);
+			} catch (error) {
+				console.warn(`Failed to delete file ${filePath}: ${error.message}`);
+			}
+		}
+	}
+	console.log("Deletion complete.");
+};
 
-main(argv);
+const rl = readline.createInterface({
+	input: process.stdin,
+	output: process.stdout,
+});
+
+const prompt = (query) => new Promise((resolve) => rl.question(query, resolve));
+
+const main = async () => {
+	console.log(
+		"Welcome to the Apple Live Photos to Google Motion Photos converter."
+	);
+
+	const inputDir = (
+		await prompt(
+			"Enter the directory path containing HEIC/JPEG/MOV/MP4 files in the same folder or subfolders: "
+		)
+	).trim();
+
+	if (!validateDirectory(inputDir)) {
+		console.error("Invalid directory path.");
+		process.exit(1);
+	}
+
+	const outputDir =
+		(
+			await prompt("Enter the output directory path (default is 'output'): ")
+		).trim() || "output";
+
+	const moveOtherImagesStr = (
+		await prompt(
+			"Do you want to move non-matching files to the 'other_files' folder in the output directory? (y/n, default is 'n'): "
+		)
+	)
+		.trim()
+		.toLowerCase();
+	const moveOtherImages = moveOtherImagesStr === "y";
+
+	const convertAllHeicStr = (
+		await prompt(
+			"Do you want to convert all HEIC files to JPEG, regardless of whether they have a matching MOV/MP4 file? (y/n, default is 'n'): "
+		)
+	)
+		.trim()
+		.toLowerCase();
+	const convertAllHeic = convertAllHeicStr === "y";
+
+	const deleteConvertedStr = (
+		await prompt(
+			"Do you want to delete converted HEIC files whether they have a matching MOV/MP4 file or not? (y/n, default is 'n'): "
+		)
+	)
+		.trim()
+		.toLowerCase();
+	const deleteConverted = deleteConvertedStr === "y";
+
+	await processDirectory(
+		inputDir,
+		outputDir,
+		moveOtherImages,
+		convertAllHeic,
+		deleteConverted
+	);
+
+	if (problematicFiles.length > 0) {
+		console.warn("The following files encountered errors during conversion:");
+		for (const filePath of problematicFiles) {
+			console.warn(filePath);
+		}
+
+		fs.writeFileSync(
+			"problematic_files.txt",
+			`The following files encountered errors during conversion:\n${problematicFiles.join(
+				"\n"
+			)}`
+		);
+	}
+
+	const deleteOriginalStr = (
+		await prompt(
+			"Do you want to delete the original HEIC and MOV/MP4 files? If not, they will be saved. (y/n, default is 'n'): "
+		)
+	)
+		.trim()
+		.toLowerCase();
+	const deleteOriginal = deleteOriginalStr === "y";
+
+	if (deleteOriginal) {
+		deleteOriginalFiles();
+	} else {
+		console.log("Original HEIC and MOV/MP4 files will be saved.");
+	}
+
+	rl.close();
+};
+
+main();
