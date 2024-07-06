@@ -1,0 +1,15 @@
+{
+  "name": "heic-mov-to-motion-photo",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "author": "Tanner Krewson",
+  "license": "MIT",
+  "dependencies": {
+    "exiftool-vendored": "^24.3.0",
+    "yargs": "^17.7.2"
+  }
+}
