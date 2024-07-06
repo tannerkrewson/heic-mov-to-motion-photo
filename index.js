@@ -3,6 +3,7 @@ const path = require("path");
 const exiftool = require("exiftool-vendored").exiftool;
 const readline = require("readline");
 const heicconvert = require("heic-jpg-exif");
+const { promisify } = require("util");
 
 const problematicFiles = [];
 const processedFiles = [];
@@ -84,33 +85,29 @@ const mergeFiles = (photoPath, videoPath, outputPath) => {
 	const photoData = fs.readFileSync(photoPath);
 	const videoData = fs.readFileSync(videoPath);
 	fs.writeFileSync(outPath, Buffer.concat([photoData, videoData]));
-	console.log("Merged photo and video.");
 	processedFiles.push(photoPath, videoPath);
 	return outPath;
 };
 
 const addXmpMetadata = async (mergedFile, offset) => {
-	const metadata = await exiftool.read(mergedFile);
-	console.log("Reading existing metadata from file.");
-	if (Object.keys(metadata).length > 0) {
-		console.warn(
-			"Found existing XMP keys. They *may* be affected after this process."
-		);
-	}
+	// the original python script does this:
+	// pyexiv2.xmp.register_namespace('http://ns.google.com/photos/1.0/camera/', 'GCamera')
+	// but idk how to do that in js and it seems to work without it
+	await exiftool.write(mergedFile, {
+		"XMP:MicroVideo": 1,
+		"XMP:MicroVideoVersion": 1,
+		"XMP:MicroVideoOffset": offset,
+		"XMP:MicroVideoPresentationTimestampUs": 1500000,
+	});
 
 	try {
-		await exiftool.write(mergedFile, {
-			"XMP:MicroVideo": 1,
-			"XMP:MicroVideoVersion": 1,
-			"XMP:MicroVideoOffset": offset,
-			"XMP:MicroVideoPresentationTimestampUs": 1500000,
-		});
+		await promisify(fs.unlink)(`${mergedFile}_original`);
 	} catch (error) {
-		console.warn("exiv2 detected that the GCamera namespace already exists.");
+		console.warn("Failed to delete", error);
 	}
 };
 
-const convert = async (photoPath, videoPath, outputPath) => {
+const createMotionPhoto = async (photoPath, videoPath, outputPath) => {
 	if (!validateMedia(photoPath, videoPath)) {
 		console.error("Invalid photo or video path.");
 		return;
@@ -177,7 +174,7 @@ const processDirectory = async (
 				if (jpegPath) {
 					const videoPath = matchingVideo(jpegPath, inputDir);
 					if (videoPath) {
-						await convert(jpegPath, videoPath, outputDir);
+						await createMotionPhoto(jpegPath, videoPath, outputDir);
 						matchingPairs++;
 
 						// delete intermediary jpg
@@ -199,7 +196,7 @@ const processDirectory = async (
 		) {
 			const videoPath = matchingVideo(filePath, inputDir);
 			if (videoPath) {
-				await convert(filePath, videoPath, outputDir);
+				await createMotionPhoto(filePath, videoPath, outputDir);
 				matchingPairs++;
 			}
 		}
@@ -233,21 +230,6 @@ const processDirectory = async (
 	}
 
 	console.log("Cleanup complete.");
-};
-
-const deleteOriginalFiles = () => {
-	console.log("Deleting original HEIC and MOV/MP4 files.");
-	for (const filePath of processedFiles) {
-		if (fs.existsSync(filePath)) {
-			try {
-				fs.unlinkSync(filePath);
-				console.log(`Deleted original file: ${filePath}`);
-			} catch (error) {
-				console.warn(`Failed to delete file ${filePath}: ${error.message}`);
-			}
-		}
-	}
-	console.log("Deletion complete.");
 };
 
 const rl = readline.createInterface({
@@ -327,21 +309,6 @@ const main = async () => {
 				"\n"
 			)}`
 		);
-	}
-
-	const deleteOriginalStr = (
-		await prompt(
-			"Do you want to delete the original HEIC and MOV/MP4 files? If not, they will be saved. (y/n, default is 'n'): "
-		)
-	)
-		.trim()
-		.toLowerCase();
-	const deleteOriginal = deleteOriginalStr === "y";
-
-	if (deleteOriginal) {
-		deleteOriginalFiles();
-	} else {
-		console.log("Original HEIC and MOV/MP4 files will be saved.");
 	}
 
 	rl.close();
