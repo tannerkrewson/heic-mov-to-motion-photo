@@ -1,9 +1,9 @@
 const fs = require("fs");
 const path = require("path");
-const sharp = require("sharp");
 const exiftool = require("exiftool-vendored").exiftool;
-const { execSync } = require("child_process");
 const readline = require("readline");
+const { promisify } = require("util");
+const heicconvert = require("heic-convert");
 
 const problematicFiles = [];
 const processedFiles = [];
@@ -40,11 +40,19 @@ const convertHeicToJpeg = async (heicPath) => {
 	console.log(`Converting HEIC file to JPEG: ${heicPath}`);
 	try {
 		const jpegPath = `${path.parse(heicPath).name}.jpg`;
-		await sharp(heicPath).jpeg().toFile(jpegPath);
+		const inputBuffer = await promisify(fs.readFile)(heicPath);
+		const outputBuffer = await heicconvert({
+			buffer: inputBuffer, // the HEIC file buffer
+			format: "JPEG", // output format
+			quality: 1, // the jpeg compression quality, between 0 and 1
+		});
+
+		await promisify(fs.writeFile)(jpegPath, outputBuffer);
 		console.log(`HEIC file converted to JPEG: ${jpegPath}`);
 
 		// Copy EXIF data from HEIC to JPEG
 		const exifData = await exiftool.read(heicPath);
+		console.log(exifData);
 		if (exifData) {
 			await exiftool.write(jpegPath, exifData);
 			console.log("EXIF data copied from HEIC to JPEG.");
@@ -189,6 +197,9 @@ const processDirectory = async (
 					if (videoPath) {
 						await convert(jpegPath, videoPath, outputDir);
 						matchingPairs++;
+
+						// delete intermediary jpg
+						fs.unlinkSync(jpegPath);
 					}
 				}
 				if (deleteConverted && fs.existsSync(filePath)) {
@@ -262,18 +273,20 @@ const rl = readline.createInterface({
 	output: process.stdout,
 });
 
-const prompt = (query) => new Promise((resolve) => rl.question(query, resolve));
+const prompt = (query) =>
+	new Promise((resolve) => rl.question(`${query}\n`, resolve));
 
 const main = async () => {
 	console.log(
-		"Welcome to the Apple Live Photos to Google Motion Photos converter."
+		"Welcome to the Apple Live Photos to Google Motion Photos converter.\n"
 	);
 
-	const inputDir = (
-		await prompt(
-			"Enter the directory path containing HEIC/JPEG/MOV/MP4 files in the same folder or subfolders: "
-		)
-	).trim();
+	const inputDir =
+		(
+			await prompt(
+				"Enter the directory path containing HEIC/JPEG/MOV/MP4 files in the same folder or subfolders (default is 'photos'): "
+			)
+		).trim() || "photos";
 
 	if (!validateDirectory(inputDir)) {
 		console.error("Invalid directory path.");
@@ -350,6 +363,8 @@ const main = async () => {
 	}
 
 	rl.close();
+
+	process.exit(0);
 };
 
 main();
