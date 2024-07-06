@@ -2,8 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const exiftool = require("exiftool-vendored").exiftool;
 const readline = require("readline");
-const { promisify } = require("util");
-const heicconvert = require("heic-convert");
+const heicconvert = require("heic-jpg-exif");
 
 const problematicFiles = [];
 const processedFiles = [];
@@ -40,25 +39,8 @@ const convertHeicToJpeg = async (heicPath) => {
 	console.log(`Converting HEIC file to JPEG: ${heicPath}`);
 	try {
 		const jpegPath = `${path.parse(heicPath).name}.jpg`;
-		const inputBuffer = await promisify(fs.readFile)(heicPath);
-		const outputBuffer = await heicconvert({
-			buffer: inputBuffer, // the HEIC file buffer
-			format: "JPEG", // output format
-			quality: 1, // the jpeg compression quality, between 0 and 1
-		});
-
-		await promisify(fs.writeFile)(jpegPath, outputBuffer);
+		await heicconvert(heicPath, jpegPath, 1);
 		console.log(`HEIC file converted to JPEG: ${jpegPath}`);
-
-		// Copy EXIF data from HEIC to JPEG
-		const exifData = await exiftool.read(heicPath);
-		console.log(exifData);
-		if (exifData) {
-			await exiftool.write(jpegPath, exifData);
-			console.log("EXIF data copied from HEIC to JPEG.");
-		} else {
-			console.warn("No EXIF data found in HEIC file.");
-		}
 
 		processedFiles.push(heicPath);
 		return jpegPath;

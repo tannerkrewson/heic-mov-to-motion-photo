@@ -10,6 +10,6 @@
 	"license": "MIT",
 	"dependencies": {
 		"exiftool-vendored": "^27.0.0",
-		"heic-convert": "^2.1.0"
+		"heic-jpg-exif": "^0.3.5"
 	}
 }
